@@ -13,15 +13,21 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 # ──────────────────────────────────────────────
-# CONFIG — من الـ Environment Variables
+# CONFIG
 # ──────────────────────────────────────────────
 
 API_BASE_URL      = "https://projecthubb.runasp.net"
 PROJECTS_ENDPOINT = f"{API_BASE_URL}/api/Projects"
-GROQ_API_KEY      = os.getenv("GROQ_API_KEY")   # ← هيتحط في Hugging Face Secrets
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 
 VALID_TRACKS = ["AI", "Backend", "Flutter", "UI/UX", "Data Science", "Mobile", "Web"]
 
+TAG_MAPPING = {
+    "ai": "AI", "backend": "Backend", "flutter": "Flutter",
+    "ui/ux": "UI/UX", "uiux": "UI/UX", "ui": "UI/UX",
+    "data science": "Data Science", "datascience": "Data Science",
+    "mobile": "Mobile", "web": "Web",
+}
 
 # ──────────────────────────────────────────────
 # REQUEST / RESPONSE MODELS
@@ -38,6 +44,41 @@ class Scenario1Request(BaseModel):
 class Scenario2Request(BaseModel):
     idea: str
 
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+
+def normalize_tags(raw_tags) -> list:
+    """
+    الـ tags ممكن تيجي بأي شكل:
+    - List of strings: ["AI", "Backend"]
+    - String مفصولة بفاصلة: "AI,Backend"
+    - String واحدة: "AI"
+    - None أو []
+    """
+    if not raw_tags:
+        return []
+    # لو String — حولها لـ list
+    if isinstance(raw_tags, str):
+        raw_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+    # لو list — تأكد إن كل عنصر string
+    if isinstance(raw_tags, list):
+        result = []
+        for t in raw_tags:
+            if isinstance(t, str):
+                mapped = TAG_MAPPING.get(t.lower().strip(), t.strip())
+                if mapped:
+                    result.append(mapped)
+        return list(set(result))
+    return []
+
+def safe_str(val) -> str:
+    """تأكد إن القيمة string"""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    return str(val)
 
 # ──────────────────────────────────────────────
 # FETCH PROJECTS FROM API
@@ -51,27 +92,29 @@ def fetch_projects_from_api() -> list:
     with urllib.request.urlopen(req, timeout=15) as response:
         data = json.loads(response.read().decode("utf-8"))
 
-    mapping = {
-        "ai": "AI", "backend": "Backend", "flutter": "Flutter",
-        "ui/ux": "UI/UX", "uiux": "UI/UX", "ui": "UI/UX",
-        "data science": "Data Science", "datascience": "Data Science",
-        "mobile": "Mobile", "web": "Web",
-    }
+    # لو الـ response مش list
+    if isinstance(data, dict):
+        data = data.get("projects") or data.get("data") or data.get("items") or []
+
     projects = []
     for item in data:
-        raw_tags = item.get("tags") or []
-        tags = list({mapping.get(t.lower().strip(), t) for t in raw_tags})
+        if not isinstance(item, dict):
+            continue
+        tags = normalize_tags(item.get("tags"))
+        desc = safe_str(item.get("description"))
+        if not desc.strip():
+            desc = safe_str(item.get("category"))
+
         projects.append({
-            "id":          item.get("id"),
-            "title":       item.get("title", "Untitled"),
-            "description": item.get("description", ""),
+            "id":          safe_str(item.get("id")),
+            "title":       safe_str(item.get("title")) or "Untitled",
+            "description": desc,
             "tags":        tags,
-            "category":    item.get("category", ""),
-            "authorName":  item.get("authorName", ""),
-            "githubUrl":   item.get("githubUrl", ""),
+            "category":    safe_str(item.get("category")),
+            "authorName":  safe_str(item.get("authorName")),
+            "githubUrl":   safe_str(item.get("githubUrl")),
         })
     return projects
-
 
 # ──────────────────────────────────────────────
 # VECTOR STORE
@@ -84,8 +127,8 @@ class VectorStore:
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         from sentence_transformers import SentenceTransformer
         import faiss
-        self._faiss   = faiss
-        self.model    = SentenceTransformer("all-MiniLM-L6-v2")
+        self._faiss = faiss
+        self.model  = SentenceTransformer("all-MiniLM-L6-v2")
         self.projects = projects
         self._build_index()
 
@@ -117,7 +160,6 @@ class VectorStore:
         self.projects = fetch_projects_from_api()
         self._build_index()
 
-
 # ──────────────────────────────────────────────
 # GROQ SERVICE
 # ──────────────────────────────────────────────
@@ -138,7 +180,8 @@ class GroqService:
         return res.choices[0].message.content.strip()
 
     def _parse_json(self, text: str):
-        return json.loads(text.replace("```json", "").replace("```", "").strip())
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
 
     def suggest_projects(self, skills: list, domain: str = None) -> list:
         skills_text = "\n".join(f"  - {s['track']}: {s['level']}" for s in skills)
@@ -157,6 +200,7 @@ Rules:
 - Be specific and realistic
 - tech_stack must be general tools based on the tracks
 - how_it_works must be 3-4 simple steps
+- recommended_tracks must be a JSON array of strings ONLY
 
 Respond ONLY with a valid JSON array, no extra text:
 [
@@ -173,7 +217,12 @@ Respond ONLY with a valid JSON array, no extra text:
     "how_it_works": ["Step 1: ...", "Step 2: ...", "Step 3: ..."]
   }}
 ]"""
-        return self._parse_json(self._call(prompt))
+        raw = self._parse_json(self._call(prompt))
+        # تأكد إن كل suggested project فيه tags كـ list مش string
+        for item in raw:
+            if isinstance(item.get("recommended_tracks"), str):
+                item["recommended_tracks"] = [t.strip() for t in item["recommended_tracks"].split(",")]
+        return raw
 
     def analyze_idea(self, idea: str) -> dict:
         prompt = f"""You are an expert academic project advisor for university students.
@@ -194,8 +243,13 @@ Respond ONLY with a valid JSON object:
   "how_it_works": ["Step 1: ...", "Step 2: ...", "Step 3: ...", "Step 4: ..."]
 }}
 
-Available tracks: AI, Backend, Flutter, UI/UX, Data Science, Mobile, Web"""
-        return self._parse_json(self._call(prompt, max_tokens=800))
+Available tracks: AI, Backend, Flutter, UI/UX, Data Science, Mobile, Web
+detected_tracks must be a JSON array of strings ONLY."""
+        raw = self._parse_json(self._call(prompt, max_tokens=800))
+        # تأكد إن detected_tracks list مش string
+        if isinstance(raw.get("detected_tracks"), str):
+            raw["detected_tracks"] = [t.strip() for t in raw["detected_tracks"].split(",")]
+        return raw
 
     def explain_similarity(self, idea: str, projects: list) -> list:
         projects_text = "\n".join(
@@ -212,7 +266,6 @@ Write ONE specific sentence per project explaining what makes it similar.
 Respond ONLY with a JSON array of strings:
 ["explanation 1", "explanation 2", ...]"""
         return self._parse_json(self._call(prompt, max_tokens=400))
-
 
 # ──────────────────────────────────────────────
 # APP STARTUP
@@ -234,7 +287,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ProjHub AI", version="1.0.0", lifespan=lifespan)
 
-# CORS — مهم جداً عشان الـ .NET والـ Flutter يقدروا يكلموا الـ API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -242,7 +294,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ──────────────────────────────────────────────
 # ENDPOINTS
@@ -260,24 +311,27 @@ def suggest(req: Scenario1Request):
     for s in suggestions:
         query   = s["title"] + " " + s["description"]
         similar = store.search(query, top_k=3, threshold=0.25)
+
+        # تأكد إن الـ tags في similar_projects دايماً List
+        similar_clean = []
+        for p in similar:
+            similar_clean.append({
+                "id":               safe_str(p.get("id")),
+                "title":            safe_str(p.get("title")),
+                "description":      safe_str(p.get("description")),
+                "tags":             normalize_tags(p.get("tags")),   # ← دايماً List
+                "authorName":       safe_str(p.get("authorName")),
+                "githubUrl":        safe_str(p.get("githubUrl")),
+                "similarity_score": p.get("similarity_score", 0.0),
+            })
+
         result.append({
-            "title":              s.get("title"),
-            "description":        s.get("description"),
-            "recommended_tracks": s.get("recommended_tracks", []),
+            "title":              safe_str(s.get("title")),
+            "description":        safe_str(s.get("description")),
+            "recommended_tracks": s.get("recommended_tracks", []),   # ← دايماً List
             "tech_stack":         s.get("tech_stack", {}),
             "how_it_works":       s.get("how_it_works", []),
-            "similar_projects": [
-                {
-                    "id":               p.get("id"),
-                    "title":            p.get("title"),
-                    "description":      p.get("description"),
-                    "tags":             p.get("tags"),
-                    "authorName":       p.get("authorName"),
-                    "githubUrl":        p.get("githubUrl"),
-                    "similarity_score": p.get("similarity_score"),
-                }
-                for p in similar
-            ],
+            "similar_projects":   similar_clean,
         })
     return {"suggestions": result}
 
@@ -288,29 +342,31 @@ def analyze(req: Scenario2Request):
         raise HTTPException(status_code=400, detail="idea is too short")
 
     analysis     = groq.analyze_idea(req.idea)
-    search_query = analysis.get("refined_title", "") + " " + analysis.get("description", req.idea)
+    search_query = safe_str(analysis.get("refined_title")) + " " + safe_str(analysis.get("description", req.idea))
     similar      = store.search(search_query, top_k=5, threshold=0.25)
     explanations = groq.explain_similarity(req.idea, similar) if similar else []
 
+    # تأكد إن الـ tags في similar_projects دايماً List
+    similar_clean = []
+    for i, p in enumerate(similar):
+        similar_clean.append({
+            "id":                     safe_str(p.get("id")),
+            "title":                  safe_str(p.get("title")),
+            "description":            safe_str(p.get("description")),
+            "tags":                   normalize_tags(p.get("tags")),   # ← دايماً List
+            "authorName":             safe_str(p.get("authorName")),
+            "githubUrl":              safe_str(p.get("githubUrl")),
+            "similarity_score":       p.get("similarity_score", 0.0),
+            "similarity_explanation": explanations[i] if i < len(explanations) else "",
+        })
+
     return {
-        "refined_title":   analysis.get("refined_title"),
-        "description":     analysis.get("description"),
-        "detected_tracks": analysis.get("detected_tracks", []),
-        "tech_stack":      analysis.get("tech_stack", {}),
-        "how_it_works":    analysis.get("how_it_works", []),
-        "similar_projects": [
-            {
-                "id":                     p.get("id"),
-                "title":                  p.get("title"),
-                "description":            p.get("description"),
-                "tags":                   p.get("tags"),
-                "authorName":             p.get("authorName"),
-                "githubUrl":              p.get("githubUrl"),
-                "similarity_score":       p.get("similarity_score"),
-                "similarity_explanation": explanations[i] if i < len(explanations) else "",
-            }
-            for i, p in enumerate(similar)
-        ],
+        "refined_title":    safe_str(analysis.get("refined_title")),
+        "description":      safe_str(analysis.get("description")),
+        "detected_tracks":  analysis.get("detected_tracks", []),   # ← دايماً List
+        "tech_stack":       analysis.get("tech_stack", {}),
+        "how_it_works":     analysis.get("how_it_works", []),
+        "similar_projects": similar_clean,
     }
 
 
