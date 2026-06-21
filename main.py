@@ -410,6 +410,70 @@ async def log_requests(request: Request, call_next):
 # ENDPOINTS - EXISTING (unchanged behavior)
 # ----------------------------------------------
 
+def _build_skills_chart() -> dict:
+    """نفس منطق /api/ai/stats/skills بس كـ helper داخلي نستخدمه جوه /suggest"""
+    counts = {}
+    for p in store.projects:
+        for tag in p.get("tags", []):
+            counts[tag] = counts.get(tag, 0) + 1
+    sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return {
+        "labels": [k for k, _ in sorted_items],
+        "values": [v for _, v in sorted_items],
+        "total_projects": len(store.projects),
+    }
+
+
+def _build_skill_gap_chart(skills: List[SkillItem], domain: Optional[str]) -> dict:
+    """نفس منطق /api/ai/skill-gap بس كـ helper داخلي نستخدمه جوه /suggest"""
+    team_tracks = {s.track: s.level for s in skills}
+    query = " ".join(team_tracks.keys()) + (f" {domain}" if domain else "")
+    candidate_projects = store.search(query, top_k=6) if query.strip() else store.projects[:6]
+
+    results = []
+    for p in candidate_projects:
+        project_tracks = p.get("tags", [])
+        missing_tracks = [t for t in project_tracks if t not in team_tracks]
+        weak_tracks    = [t for t in project_tracks if team_tracks.get(t) == "Beginner"]
+
+        total_required = max(len(project_tracks), 1)
+        gap_score = round((len(missing_tracks) + 0.5 * len(weak_tracks)) / total_required, 2)
+        gap_score = min(gap_score, 1.0)
+
+        if gap_score == 0:
+            status = "ready"
+        elif gap_score <= 0.4:
+            status = "minor_gap"
+        else:
+            status = "needs_work"
+
+        recommendation = groq.skill_gap_recommendation(p.get("title", "this project"), missing_tracks, weak_tracks)
+
+        results.append({
+            "project_id":      p.get("id"),
+            "project_title":   p.get("title"),
+            "project_tracks":  project_tracks,
+            "missing_tracks":  missing_tracks,
+            "weak_tracks":     weak_tracks,
+            "gap_score":       gap_score,
+            "status":          status,
+            "recommendation":  recommendation,
+        })
+
+    ready_count      = sum(1 for r in results if r["status"] == "ready")
+    needs_work_count = sum(1 for r in results if r["status"] == "needs_work")
+
+    return {
+        "projects": results,
+        "summary": {
+            "total_analyzed": len(results),
+            "ready_projects": ready_count,
+            "needs_work":     needs_work_count,
+            "minor_gap":      len(results) - ready_count - needs_work_count,
+        },
+    }
+
+
 @app.post("/api/ai/suggest")
 def suggest(req: Scenario1Request):
     if not req.skills:
@@ -443,7 +507,14 @@ def suggest(req: Scenario1Request):
             "how_it_works":       s.get("how_it_works", []),
             "similar_projects":   similar_clean,
         })
-    return {"suggestions": result}
+
+    # الإضافة الجديدة: الـ charts بترجع تلقائي جوه نفس الـ response
+    # أي حقل قديم فوق ده متغيرش؛ دول حقلين إضافيين بس على نفس مستوى "suggestions"
+    return {
+        "suggestions":      result,
+        "skills_chart":     _build_skills_chart(),
+        "skill_gap_chart":  _build_skill_gap_chart(req.skills, req.domain),
+    }
 
 
 @app.post("/api/ai/analyze")
@@ -476,6 +547,7 @@ def analyze(req: Scenario2Request):
         "tech_stack":       analysis.get("tech_stack", {}),
         "how_it_works":     analysis.get("how_it_works", []),
         "similar_projects": similar_clean,
+        "skills_chart":     _build_skills_chart(),
     }
 
 
