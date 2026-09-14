@@ -1,6 +1,6 @@
 # ProjHub AI
 
-AI microservice powering [ProjHub](link-if-you-have-one) — a graduation-project
+AI microservice powering ProjHub  a graduation-project
 management platform. This service is the intelligence layer only; the full
 platform also includes a Flutter frontend and a .NET backend (not part of
 this repo).
